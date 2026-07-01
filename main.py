@@ -24,7 +24,7 @@ Pré-requisitos:
   pip install boto3
   Credenciais configuradas via `aws configure` ou variáveis de ambiente.
 
-Autor: Leonardo
+Autor: Leonardo e Paulo
 """
 
 import boto3
@@ -80,7 +80,7 @@ PROJECT_NAME = "nexus-todo"
 
 session = boto3.Session(
     aws_access_key_id="",
-    aws_secret_access_key="+",
+    aws_secret_access_key="",
     aws_session_token="",
     region_name=REGION,
 )
