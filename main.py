@@ -67,7 +67,7 @@ REPO_FRONTEND_URL = "https://github.com/LeonardoJr96/frontend_to_do_list.git"
 # internamente, só em 127.0.0.1 — nunca exposto direto pra internet).
 EC2_APP_PORT = 80
 
-PROJECT_NAME = "nexus-todo"
+PROJECT_NAME = "lab-aws-cloud"
 
 # ============================================================
 # CREDENCIAIS DO LEARNING LAB
