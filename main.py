@@ -283,7 +283,7 @@ def create_load_balancer(public_subnets, alb_sg, vpc_id):
         Port=EC2_APP_PORT,
         VpcId=vpc_id,
         TargetType="instance",
-        HealthCheckPath="/health",
+        HealthCheckPath="/",
     )["TargetGroups"][0]
     tg_arn = tg["TargetGroupArn"]
 
@@ -311,11 +311,12 @@ def user_data_script(db_endpoint):
     Script que roda automaticamente quando cada instância do Auto Scaling liga.
 
     O que ele faz, na ordem:
-      1. Instala Docker, Git, Node.js 20 e Nginx.
+      1. Instala Python, Git, Node.js 20 e Nginx.
       2. Cria um swapfile (t2.micro só tem 1GB RAM — o build do Vite pode
          estourar memória sem isso).
-      3. Clona o backend (FastAPI) e sobe ele em um container Docker,
-         escutando SÓ em 127.0.0.1:8000 (nunca exposto direto pra internet).
+      3. Clona o backend (FastAPI), instala as dependências e sobe a API
+         diretamente na instância via systemd, escutando em 127.0.0.1:8000
+         (nunca exposto direto pra internet).
          A DATABASE_URL do RDS Postgres é injetada aqui — fica fixa no
          backend, o usuário final nunca vê nem digita esse dado.
       4. Clona o frontend (React/Vite), builda como arquivos estáticos
@@ -332,14 +333,11 @@ set -e
 
 # ---- Dependências base ----
 dnf update -y
-dnf install -y docker git nginx
+dnf install -y python3 python3-pip git nginx
 
 # Node.js 20 (o AL2023 traz uma versão mais antiga por padrão via dnf)
 curl -fsSL https://rpm.nodesource.com/setup_20.x | bash -
 dnf install -y nodejs
-
-systemctl enable --now docker
-usermod -aG docker ec2-user
 
 # ---- Swap: evita OOM durante o npm run build em instância t2.micro (1GB RAM) ----
 dd if=/dev/zero of=/swapfile bs=128M count=16
@@ -347,22 +345,72 @@ chmod 600 /swapfile
 mkswap /swapfile
 swapon /swapfile
 
-# ---- Backend (FastAPI, rodando em container Docker) ----
+# ---- Backend (FastAPI, rodando diretamente na instância via systemd) ----
 cd /home/ec2-user
 git clone {REPO_BACKEND_URL} backend
 cd backend
-docker build -t todo-backend .
-docker run -d --name backend --restart always \\
-  -p 127.0.0.1:8000:8000 \\
-  -e DATABASE_URL="{db_url}" \\
-  todo-backend
+python3 -m pip install --upgrade pip
+python3 -m pip install -r requirements.txt uvicorn
+
+cat > /home/ec2-user/start_backend.sh << 'STARTEOF'
+#!/bin/bash
+set -e
+cd /home/ec2-user/backend
+if [ -f app/main.py ]; then
+  APP_MODULE=\"app.main:app\"
+else
+  APP_MODULE=\"main:app\"
+fi
+export DATABASE_URL="$DATABASE_URL"
+for i in $(seq 1 24); do
+  if python3 - <<'PY'
+import os
+import socket
+url = os.environ.get("DATABASE_URL", "")
+if not url:
+    raise SystemExit(1)
+try:
+    host = url.split("@")[-1].split(":")[0]
+    socket.create_connection((host, 5432), timeout=2)
+    raise SystemExit(0)
+except Exception:
+    raise SystemExit(1)
+PY
+  then
+    break
+  fi
+  sleep 10
+done
+exec /usr/bin/python3 -m uvicorn "$APP_MODULE" --host 127.0.0.1 --port 8000
+STARTEOF
+chmod +x /home/ec2-user/start_backend.sh
+
+cat > /etc/systemd/system/backend.service << 'SERVICEEOF'
+[Unit]
+Description=FastAPI Backend
+After=network.target
+
+[Service]
+WorkingDirectory=/home/ec2-user/backend
+Environment=DATABASE_URL=__DATABASE_URL__
+ExecStart=/home/ec2-user/start_backend.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+SERVICEEOF
+
+sed -i \"s|__DATABASE_URL__|{db_url}|g\" /etc/systemd/system/backend.service
+systemctl daemon-reload
+systemctl enable --now backend
 
 # ---- Frontend (React + Vite, build estático servido pelo Nginx) ----
 cd /home/ec2-user
 git clone {REPO_FRONTEND_URL} frontend
 cd frontend
 echo "VITE_API_URL=/api" > .env.production
-npm ci
+npm ci || npm install
 npm run build
 mkdir -p /var/www/frontend
 cp -r dist/* /var/www/frontend/
@@ -382,7 +430,7 @@ server {{
     }}
 
     location /health {{
-        proxy_pass http://127.0.0.1:8000/health;
+        proxy_pass http://127.0.0.1:8000/;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
     }}
@@ -396,6 +444,14 @@ NGINXEOF
 rm -f /etc/nginx/conf.d/default.conf
 systemctl enable --now nginx
 systemctl restart nginx
+sleep 20
+for i in $(seq 1 12); do
+  if curl -fsS http://127.0.0.1/health >/dev/null 2>&1; then
+    exit 0
+  fi
+  sleep 5
+done
+exit 1
 """
 
 
