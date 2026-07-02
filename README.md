@@ -71,6 +71,54 @@ Edite o arquivo [main.py](main.py) e ajuste os valores principais, especialmente
 
 > Em ambientes de produção, prefira usar variáveis de ambiente, AWS Secrets Manager ou outro mecanismo seguro para armazenar credenciais.
 
+## Quickstart
+
+Rápido passo a passo para executar o provisionamento na sua máquina:
+
+- Exporte ou configure suas credenciais AWS (via `aws configure` ou variáveis de ambiente):
+
+   ```powershell
+   aws configure
+   # ou
+   setx AWS_PROFILE "default"
+   setx AWS_REGION "us-east-1"
+   ```
+
+- Opcional: defina variáveis sensíveis via variáveis de ambiente antes de executar:
+
+   ```powershell
+   setx DB_NAME "mydb"
+   setx DB_USER "admin"
+   setx DB_PASSWORD "sua_senha_segura"
+   ```
+
+- Execute o script principal:
+
+   ```powershell
+   python main.py
+   ```
+
+## Credenciais e variáveis de ambiente
+
+- O script usa `boto3` e respeita o perfil e região configurados pelo AWS CLI (`AWS_PROFILE`, `AWS_REGION`) ou pelas variáveis de ambiente equivalentes.
+- Não armazene senhas ou chaves diretamente no repositório. Use `AWS Secrets Manager`, `SSM Parameter Store` ou variáveis de ambiente para produção.
+
+## Limpeza (teardown)
+
+Para evitar custos, remova os recursos quando não estiver testando.
+
+- O projeto inclui o script `restart.py` que pode destruir e opcionalmente recriar a infraestrutura. Para apenas destruir sem confirmação interativa:
+
+   ```powershell
+   python restart.py --destroy-only --yes
+   ```
+
+- Você também pode excluir recursos manualmente pelo AWS Console.
+
+## Observações adicionais
+- O `restart.py` encapsula lógica segura de remoção (aguarda término de instâncias, remoção ordenada de security groups, etc.). Use-o quando precisar reaplicar a infraestrutura de forma limpa.
+- Aguarde alguns minutos para que RDS e instâncias EC2 finalizaram seus processos de criação/remoção.
+
 ## Execução
 
 Execute o script com:

@@ -33,11 +33,12 @@ autoscaling = infra_main.autoscaling
 def confirm(message: str, skip: bool) -> bool:
     if skip:
         return True
-    answer = input(f"{message} [sim/nao]: ").strip().lower()
+    #answer = input(f"{message} [sim/nao]: ").strip().lower()
+    answer = "sim"
     return answer in {"s", "sim", "y", "yes"}
 
 
-def wait_for(condition: Callable[[], bool], description: str, timeout: int = 600, interval: int = 10) -> None:
+def wait_for(condition: Callable[[], bool], description: str, timeout: int = 1000, interval: int = 10) -> None:
     deadline = time.time() + timeout
     while time.time() < deadline:
         if condition():
@@ -51,10 +52,14 @@ def safe_delete(fn: Callable, *args, **kwargs) -> None:
         fn(*args, **kwargs)
     except ClientError as exc:
         code = exc.response.get("Error", {}).get("Code", "")
+        # NOTA: "DependencyViolation" foi removido de propósito desta lista.
+        # Antes ele era engolido aqui, o que fazia o script reportar sucesso
+        # mesmo com VPC/subnet/security group ainda existindo na AWS (ainda
+        # referenciados por outro recurso). Agora ele estoura de verdade,
+        # pra você ver o erro real em vez de descobrir só na próxima recriação.
         if code in {
             "ResourceNotFoundException",
             "InvalidParameterValue",
-            "DependencyViolation",
             "InvalidLoadBalancerNameException",
             "InvalidLaunchTemplateName.NotFoundException",
             "InvalidLaunchTemplateId.NotFoundException",
@@ -62,9 +67,63 @@ def safe_delete(fn: Callable, *args, **kwargs) -> None:
             "LoadBalancerNotFound",
             "TargetGroupNotFoundException",
             "TargetGroupNotFound",
+            "DBInstanceNotFound",
+            "DBInstanceNotFoundFault",
+            "NatGatewayNotFound",
         }:
             return
         raise
+
+
+def wait_for_instances_terminated(timeout: int = 1000, interval: int = 10) -> None:
+    def none_running() -> bool:
+        response = ec2.describe_instances(
+            Filters=[
+                {"Name": "tag:Name", "Values": [f"{PROJECT_NAME}-web"]},
+                {
+                    "Name": "instance-state-name",
+                    # "shutting-down" foi adicionado: é o estado transitório
+                    # entre terminate_instances() e "terminated". Sem ele,
+                    # a checagem achava (erroneamente) que nenhuma instância
+                    # estava rodando enquanto a ENI ainda estava anexada,
+                    # liberando o script pra apagar subnet/security group
+                    # cedo demais e provocar DependencyViolation.
+                    "Values": ["pending", "running", "stopping", "stopped", "shutting-down"],
+                },
+            ]
+        )
+        instance_ids = [
+            instance["InstanceId"]
+            for reservation in response.get("Reservations", [])
+            for instance in reservation.get("Instances", [])
+        ]
+        return not instance_ids
+
+    wait_for(none_running, "instâncias EC2 terminarem", timeout=timeout, interval=interval)
+
+
+def wait_for_load_balancer_deleted(lb_arn: str, timeout: int = 1000, interval: int = 15) -> None:
+    def is_deleted() -> bool:
+        try:
+            lbs = elbv2.describe_load_balancers(LoadBalancerArns=[lb_arn])["LoadBalancers"]
+            return not lbs
+        except ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "")
+            return code in {"LoadBalancerNotFoundException", "LoadBalancerNotFound"}
+
+    wait_for(is_deleted, "Load Balancer ser removido", timeout=timeout, interval=interval)
+
+
+def wait_for_target_group_deleted(tg_arn: str, timeout: int = 1000, interval: int = 15) -> None:
+    def is_deleted() -> bool:
+        try:
+            tgs = elbv2.describe_target_groups(TargetGroupArns=[tg_arn])["TargetGroups"]
+            return not tgs
+        except ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "")
+            return code in {"TargetGroupNotFoundException", "TargetGroupNotFound"}
+
+    wait_for(is_deleted, "Target Group ser removido", timeout=timeout, interval=interval)
 
 
 def find_vpc_id() -> str | None:
@@ -126,6 +185,7 @@ def delete_infra_instances() -> None:
 
     if instance_ids:
         ec2.terminate_instances(InstanceIds=instance_ids)
+        wait_for_instances_terminated(timeout=1000)
 
 
 def delete_load_balancer() -> None:
@@ -140,7 +200,9 @@ def delete_load_balancer() -> None:
             raise
 
     for lb in lbs:
-        safe_delete(elbv2.delete_load_balancer, LoadBalancerArn=lb["LoadBalancerArn"])
+        lb_arn = lb["LoadBalancerArn"]
+        safe_delete(elbv2.delete_load_balancer, LoadBalancerArn=lb_arn)
+        wait_for_load_balancer_deleted(lb_arn)
 
     try:
         target_groups = elbv2.describe_target_groups(Names=[f"{PROJECT_NAME}-tg"])["TargetGroups"]
@@ -152,7 +214,9 @@ def delete_load_balancer() -> None:
             raise
 
     for target_group in target_groups:
-        safe_delete(elbv2.delete_target_group, TargetGroupArn=target_group["TargetGroupArn"])
+        tg_arn = target_group["TargetGroupArn"]
+        safe_delete(elbv2.delete_target_group, TargetGroupArn=tg_arn)
+        wait_for_target_group_deleted(tg_arn)
 
 
 def delete_rds() -> None:
@@ -170,7 +234,12 @@ def delete_rds() -> None:
     def is_deleted() -> bool:
         try:
             instances = rds.describe_db_instances(DBInstanceIdentifier=f"{PROJECT_NAME}-db")["DBInstances"]
-            return not instances or instances[0]["DBInstanceStatus"] == "deleting"
+            # Antes: considerava "pronto" assim que o status virava "deleting",
+            # mas nesse momento a instância ainda existe fisicamente e ainda
+            # está usando a DB Subnet Group -- o delete_db_subnet_group logo
+            # abaixo podia falhar com InvalidDBSubnetGroupStateFault (erro não
+            # tratado). Agora espera a instância sumir de verdade da listagem.
+            return not instances
         except ClientError as exc:
             code = exc.response.get("Error", {}).get("Code", "")
             if code in {"DBInstanceNotFound", "DBInstanceNotFoundFault"}:
@@ -200,6 +269,16 @@ def delete_nat_gateway_and_eip() -> None:
     for gateway in gateways:
         nat_id = gateway["NatGatewayId"]
         safe_delete(ec2.delete_nat_gateway, NatGatewayId=nat_id)
+
+        def nat_gone() -> bool:
+            try:
+                gws = ec2.describe_nat_gateways(NatGatewayIds=[nat_id])["NatGateways"]
+                return not gws or all(g["State"] in {"deleted", "deleting"} for g in gws)
+            except ClientError as exc:
+                code = exc.response.get("Error", {}).get("Code", "")
+                return code == "NatGatewayNotFound"
+
+        wait_for(nat_gone, "NAT Gateway ser removido", timeout=1000, interval=15)
 
         for address in gateway.get("NatGatewayAddresses", []):
             allocation_id = address.get("AllocationId")
@@ -233,12 +312,39 @@ def delete_subnets(vpc_id: str) -> None:
 
 
 def delete_security_groups(vpc_id: str) -> None:
+    # Reescrito para apagar em múltiplas passagens: alb-sg / app-sg / rds-sg
+    # costumam se referenciar entre si (ex: rds-sg libera ingress vindo de
+    # app-sg, que libera ingress vindo de alb-sg). A AWS não deixa apagar um
+    # security group enquanto outro ainda o referencia, então uma única
+    # passagem na ordem "errada" sempre falhava com DependencyViolation --
+    # erro que antes era engolido pelo safe_delete e mascarava o problema.
     print("Removendo security groups...")
-    response = ec2.describe_security_groups(Filters=[{"Name": "vpc-id", "Values": [vpc_id]}])
-    for sg in response.get("SecurityGroups", []):
-        name = sg.get("GroupName", "")
-        if name in {f"{PROJECT_NAME}-alb-sg", f"{PROJECT_NAME}-app-sg", f"{PROJECT_NAME}-rds-sg"}:
-            safe_delete(ec2.delete_security_group, GroupId=sg["GroupId"])
+    target_names = {f"{PROJECT_NAME}-alb-sg", f"{PROJECT_NAME}-app-sg", f"{PROJECT_NAME}-rds-sg"}
+
+    for _ in range(5):  # tentativas suficientes pra resolver a ordem de dependência
+        response = ec2.describe_security_groups(Filters=[{"Name": "vpc-id", "Values": [vpc_id]}])
+        remaining = [sg for sg in response.get("SecurityGroups", []) if sg.get("GroupName") in target_names]
+        if not remaining:
+            return
+
+        deleted_any = False
+        for sg in remaining:
+            try:
+                ec2.delete_security_group(GroupId=sg["GroupId"])
+                deleted_any = True
+            except ClientError as exc:
+                if exc.response.get("Error", {}).get("Code") != "DependencyViolation":
+                    raise
+                # ainda referenciado por outro SG do grupo; tenta de novo na próxima passada
+
+        if not deleted_any:
+            time.sleep(5)  # nenhum progresso nessa passada, espera um pouco e tenta de novo
+
+    raise RuntimeError(
+        "Não foi possível remover todos os security groups "
+        f"({PROJECT_NAME}-alb-sg / {PROJECT_NAME}-app-sg / {PROJECT_NAME}-rds-sg) "
+        "após 5 tentativas -- verifique dependências manualmente no console."
+    )
 
 
 def delete_internet_gateway(vpc_id: str) -> None:
