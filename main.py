@@ -29,6 +29,7 @@ Autor: Leonardo e Paulo
 
 import boto3
 import time
+from botocore.exceptions import ClientError
 
 # ============================================================
 # CONFIGURAÇÕES GERAIS — ajuste aqui antes de rodar
@@ -468,36 +469,51 @@ def create_auto_scaling_group(lt_id, public_subnets, tg_arn):
 # 11. RDS PostgreSQL — Multi-AZ, dentro das subnets privadas
 # ============================================================
 def create_rds(private_subnets, rds_sg):
-    # DB Subnet Group precisa cobrir pelo menos 2 AZs — é isso que habilita o Multi-AZ
-    rds.create_db_subnet_group(
-        DBSubnetGroupName=f"{PROJECT_NAME}-db-subnet-group",
-        DBSubnetGroupDescription="Subnets privadas para o RDS",
-        SubnetIds=private_subnets,
-    )
+    subnet_group_name = f"{PROJECT_NAME}-db-subnet-group"
+    db_identifier = f"{PROJECT_NAME}-db"
+
+    try:
+        rds.create_db_subnet_group(
+            DBSubnetGroupName=subnet_group_name,
+            DBSubnetGroupDescription="Subnets privadas para o RDS",
+            SubnetIds=private_subnets,
+        )
+        print(f"DB subnet group criado: {subnet_group_name}")
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "")
+        if code != "DBSubnetGroupAlreadyExists":
+            raise
+        print(f"DB subnet group já existe: {subnet_group_name}")
 
     print("Criando instância RDS Multi-AZ (leva de 5 a 10 minutos)...")
-    rds.create_db_instance(
-        DBInstanceIdentifier=f"{PROJECT_NAME}-db",
-        DBName=DB_NAME,
-        Engine="postgres",
-        MasterUsername=DB_USER,
-        MasterUserPassword=DB_PASSWORD,
-        DBInstanceClass=DB_INSTANCE_CLASS,
-        AllocatedStorage=20,
-        VpcSecurityGroupIds=[rds_sg],
-        DBSubnetGroupName=f"{PROJECT_NAME}-db-subnet-group",
-        MultiAZ=True,             # cria réplica síncrona automática na 2ª AZ
-        PubliclyAccessible=False,  # fica só acessível de dentro da VPC
-        BackupRetentionPeriod=7,
-        StorageEncrypted=True,
-    )
+    try:
+        rds.create_db_instance(
+            DBInstanceIdentifier=db_identifier,
+            DBName=DB_NAME,
+            Engine="postgres",
+            MasterUsername=DB_USER,
+            MasterUserPassword=DB_PASSWORD,
+            DBInstanceClass=DB_INSTANCE_CLASS,
+            AllocatedStorage=20,
+            VpcSecurityGroupIds=[rds_sg],
+            DBSubnetGroupName=subnet_group_name,
+            MultiAZ=True,             # cria réplica síncrona automática na 2ª AZ
+            PubliclyAccessible=False,  # fica só acessível de dentro da VPC
+            BackupRetentionPeriod=7,
+            StorageEncrypted=True,
+        )
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "")
+        if code not in {"DBInstanceAlreadyExists", "DBInstanceAlreadyExistsFault"}:
+            raise
+        print(f"Instância RDS já existe: {db_identifier}")
 
     rds.get_waiter("db_instance_available").wait(
-        DBInstanceIdentifier=f"{PROJECT_NAME}-db"
+        DBInstanceIdentifier=db_identifier
     )
 
     endpoint = rds.describe_db_instances(
-        DBInstanceIdentifier=f"{PROJECT_NAME}-db"
+        DBInstanceIdentifier=db_identifier
     )["DBInstances"][0]["Endpoint"]["Address"]
     print(f"RDS disponível em: {endpoint}")
     return endpoint
