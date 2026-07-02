@@ -2,37 +2,33 @@
 Script de provisionamento de infraestrutura AWS usando boto3.
 
 Cria (arquitetura equivalente ao Lab 6 da AWS Academy, com RDS Postgres):
-  - 1 VPC, 2 AZs (subnet pública + privada em cada)
-  - Internet Gateway (subnets públicas) + NAT Gateway (subnets privadas)
+  - 1 VPC
+  - 2 Availability Zones, cada uma com:
+      - 1 subnet pública (IP público automático)
+      - 1 subnet privada (sem IP público direto)
+  - Internet Gateway (para as subnets públicas)
+  - NAT Gateway (para as subnets privadas saírem pra internet)
   - Route Tables (pública -> IGW, privada -> NAT)
   - Security Groups em cadeia: Internet -> ALB -> App(Nginx) -> RDS
-  - Application Load Balancer nas subnets públicas
+  - Application Load Balancer (nas subnets públicas)
   - Launch Template + Auto Scaling Group (2-6 instâncias, scaling por CPU 60%)
-    Cada instância roda backend FastAPI (systemd, 127.0.0.1:8000) e frontend
-    React/Vite estático, servidos pelo Nginx na porta 80 (proxy de /api/*
-    pro backend -- resolve CORS de graça, mesma origem).
-  - RDS PostgreSQL Multi-AZ nas subnets privadas
+    Cada instância roda:
+      - Backend FastAPI em container Docker (127.0.0.1:8000, isolado)
+      - Frontend React/Vite buildado como estático
+      - Nginx servindo o front na porta 80 e fazendo proxy reverso de
+        /api/* pro backend (resolve CORS de graça, mesma origem)
+  - RDS PostgreSQL Multi-AZ (nas subnets privadas)
+  - DATABASE_URL do RDS fica embutida no backend (não é pedida ao usuário)
 
 Pré-requisitos:
   pip install boto3
-  Credenciais via `aws configure` OU variáveis de ambiente:
-    export AWS_ACCESS_KEY_ID=...
-    export AWS_SECRET_ACCESS_KEY=...
-    export AWS_SESSION_TOKEN=...   (Learning Lab expira em algumas horas --
-                                     se der ExpiredToken, pegue credenciais
-                                     novas na aba "AWS Details" > "AWS CLI")
-
-Idempotente: pode rodar de novo que ele reaproveita o que já existe (acha
-por tag "Name" / nome do recurso) em vez de duplicar.
+  Credenciais configuradas via `aws configure` ou variáveis de ambiente.
 
 Autor: Leonardo e Paulo
 """
 
-import base64
-import time
-
 import boto3
-from botocore.exceptions import ClientError, WaiterError
+import time
 
 # ============================================================
 # CONFIGURAÇÕES GERAIS — ajuste aqui antes de rodar
@@ -45,30 +41,50 @@ PRIVATE_SUBNET_CIDRS = ["10.0.11.0/24", "10.0.12.0/24"]
 
 DB_NAME = "nexusdb"
 DB_USER = "postgres"
-DB_PASSWORD = "TrocarEssaSenha123!"  # NUNCA em produção -- use Secrets Manager
+DB_PASSWORD = "TrocarEssaSenha123!"  # NUNCA deixe hardcoded em produção — use Secrets Manager
 DB_INSTANCE_CLASS = "db.t3.micro"
 
-# No AWS Academy Learning Lab, EC2/RDS só podem usar o LabInstanceProfile
-# (pré-criado no lab -- não dá pra criar IAM roles novas).
+# No AWS Academy Learning Lab, EC2 e RDS só podem usar o LabInstanceProfile
+# (ele já vem pré-criado no lab). Não é possível criar IAM roles novas.
 EC2_INSTANCE_PROFILE = "LabInstanceProfile"
-EC2_INSTANCE_TYPE = "t3.small"
-EC2_AMI_ID = "ami-0453ec754f44f9a4a"  # Amazon Linux 2023, us-east-1
+EC2_INSTANCE_TYPE = "t3.small"  # única classe liberada na maioria dos labs
+# ATENÇÃO: t2.micro tem só 1GB RAM. O build do frontend (npm run build) pode
+# estourar a memória. O script cria um swapfile pra mitigar isso, mas se o
+# lab permitir, prefira t3.small.
 
-# Sem key pair não dá pra entrar via SSH pra debugar (/var/log/user-data.log,
-# journalctl -u backend). Recomendado criar uma no console EC2.
-EC2_KEY_NAME = None
+# AMI Amazon Linux 2023 (us-east-1). Se sua região for outra, atualize.
+EC2_AMI_ID = "ami-0453ec754f44f9a4a"
 
+# Key pair usado para acessar as instâncias via SSH (crie antes no console, se precisar debugar)
+EC2_KEY_NAME = None  # ex: "minha-chave" — deixe None se não for acessar via SSH
+
+# Repositórios da aplicação (clonados direto na instância via user-data)
 REPO_BACKEND_URL = "https://github.com/LeonardoJr96/backend_to_do_list.git"
 REPO_FRONTEND_URL = "https://github.com/LeonardoJr96/frontend_to_do_list.git"
 
-# Porta liberada pelo ALB/SG -- é 80 porque o Nginx no host recebe o
-# tráfego e faz proxy pro backend em 127.0.0.1:8000 (nunca exposto direto).
+# Porta que o ALB e o Security Group liberam. Agora é 80 porque o Nginx,
+# rodando no host, é quem recebe o tráfego (e faz proxy pro backend na 8000
+# internamente, só em 127.0.0.1 — nunca exposto direto pra internet).
 EC2_APP_PORT = 80
 
 PROJECT_NAME = "lab-aws-cloud"
 
-# Credenciais vêm do ambiente / `aws configure` -- nunca hardcoded aqui.
-session = boto3.Session(region_name=REGION)
+# ============================================================
+# CREDENCIAIS DO LEARNING LAB
+# ============================================================
+# O Learning Lab NÃO usa `aws configure` normal. Ele te dá 3 valores temporários
+# na aba "AWS Details" -> "AWS CLI": Access Key, Secret Key e Session Token.
+# Cole eles aqui (ou exporte como variáveis de ambiente) ANTES de rodar o script.
+# Esses valores expiram em algumas horas — se o script falhar com erro de
+# autenticação, é sinal de pegar credenciais novas no Learning Lab.
+
+session = boto3.Session(
+    aws_access_key_id="",
+    aws_secret_access_key="",
+    aws_session_token="",
+    region_name=REGION,
+)
+
 ec2 = session.client("ec2")
 elbv2 = session.client("elbv2")
 rds = session.client("rds")
@@ -76,414 +92,297 @@ autoscaling = session.client("autoscaling")
 
 
 def tag(resource_id, name):
+    """Ajuda a nomear recursos — sem isso fica tudo com IDs feios no console."""
     ec2.create_tags(Resources=[resource_id], Tags=[{"Key": "Name", "Value": name}])
-
-
-def get_or_create(description, describe_fn, create_fn):
-    """
-    Helper genérico de idempotência: tenta achar o recurso pelo describe_fn;
-    se não existir, cria com create_fn. Evita duplicar VPC, subnet, SG, LB,
-    TG, LT etc. toda vez que o script roda de novo.
-    """
-    existing = describe_fn()
-    if existing:
-        print(f"{description} já existe.")
-        return existing
-    print(f"Criando {description}...")
-    created = create_fn()
-    print(f"{description} criado.")
-    return created
-
-
-def safe_authorize_ingress(group_id, ip_permissions):
-    try:
-        ec2.authorize_security_group_ingress(GroupId=group_id, IpPermissions=ip_permissions)
-    except ClientError as exc:
-        if exc.response["Error"]["Code"] != "InvalidPermission.Duplicate":
-            raise
-
-
-def find_by_name_tag(describe_call, key, resources_key, name):
-    """Busca genérica por tag Name=<name> em describe_vpcs/subnets/route_tables/security_groups."""
-    response = describe_call(Filters=[{"Name": "tag:Name", "Values": [name]}])
-    items = response.get(resources_key, [])
-    return items[0] if items else None
 
 
 # ============================================================
 # 1. VPC
 # ============================================================
 def create_vpc():
-    def describe():
-        return find_by_name_tag(ec2.describe_vpcs, "tag:Name", "Vpcs", f"{PROJECT_NAME}-vpc")
+    print("Criando VPC...")
+    vpc = ec2.create_vpc(CidrBlock=VPC_CIDR)["Vpc"]
+    vpc_id = vpc["VpcId"]
+    ec2.get_waiter("vpc_available").wait(VpcIds=[vpc_id])
+    tag(vpc_id, f"{PROJECT_NAME}-vpc")
 
-    def create():
-        vpc = ec2.create_vpc(CidrBlock=VPC_CIDR)["Vpc"]
-        ec2.get_waiter("vpc_available").wait(VpcIds=[vpc["VpcId"]])
-        tag(vpc["VpcId"], f"{PROJECT_NAME}-vpc")
-        # RDS exige DNS habilitado na VPC pra resolver o endpoint do banco
-        ec2.modify_vpc_attribute(VpcId=vpc["VpcId"], EnableDnsSupport={"Value": True})
-        ec2.modify_vpc_attribute(VpcId=vpc["VpcId"], EnableDnsHostnames={"Value": True})
-        return vpc
+    # O RDS exige DNS habilitado na VPC para resolver o endpoint do banco
+    ec2.modify_vpc_attribute(VpcId=vpc_id, EnableDnsSupport={"Value": True})
+    ec2.modify_vpc_attribute(VpcId=vpc_id, EnableDnsHostnames={"Value": True})
 
-    return get_or_create("VPC", describe, create)["VpcId"]
+    print(f"VPC criada: {vpc_id}")
+    return vpc_id
 
 
+# ============================================================
+# 2. Availability Zones disponíveis na região
+# ============================================================
 def get_azs():
-    azs = ec2.describe_availability_zones(Filters=[{"Name": "state", "Values": ["available"]}])
-    return [az["ZoneName"] for az in azs["AvailabilityZones"][:2]]
+    azs = ec2.describe_availability_zones(
+        Filters=[{"Name": "state", "Values": ["available"]}]
+    )["AvailabilityZones"]
+    return [az["ZoneName"] for az in azs[:2]]  # pega as 2 primeiras disponíveis
 
 
 # ============================================================
-# 2. Subnets — uma pública + uma privada por AZ
+# 3. Subnets — uma pública + uma privada por AZ
 # ============================================================
-def create_subnet(vpc_id, cidr, az, name, public):
-    def describe():
-        response = ec2.describe_subnets(Filters=[{"Name": "vpc-id", "Values": [vpc_id]}, {"Name": "tag:Name", "Values": [name]}])
-        subnets = response.get("Subnets", [])
-        return subnets[0] if subnets else None
-
-    def create():
-        subnet = ec2.create_subnet(VpcId=vpc_id, CidrBlock=cidr, AvailabilityZone=az)["Subnet"]
-        if public:
-            ec2.modify_subnet_attribute(SubnetId=subnet["SubnetId"], MapPublicIpOnLaunch={"Value": True})
-        tag(subnet["SubnetId"], name)
-        return subnet
-
-    return get_or_create(f"Subnet {name}", describe, create)["SubnetId"]
-
-
 def create_subnets(vpc_id, azs):
-    public_subnets = [
-        create_subnet(vpc_id, PUBLIC_SUBNET_CIDRS[i], az, f"{PROJECT_NAME}-public-{az}", public=True)
-        for i, az in enumerate(azs)
-    ]
-    private_subnets = [
-        create_subnet(vpc_id, PRIVATE_SUBNET_CIDRS[i], az, f"{PROJECT_NAME}-private-{az}", public=False)
-        for i, az in enumerate(azs)
-    ]
-    print(f"Subnets públicas: {public_subnets} | privadas: {private_subnets}")
+    public_subnets = []
+    private_subnets = []
+
+    for i, az in enumerate(azs):
+        pub = ec2.create_subnet(
+            VpcId=vpc_id, CidrBlock=PUBLIC_SUBNET_CIDRS[i], AvailabilityZone=az
+        )["Subnet"]
+        # Isso faz instâncias criadas nessa subnet ganharem IP público automaticamente
+        ec2.modify_subnet_attribute(
+            SubnetId=pub["SubnetId"], MapPublicIpOnLaunch={"Value": True}
+        )
+        tag(pub["SubnetId"], f"{PROJECT_NAME}-public-{az}")
+        public_subnets.append(pub["SubnetId"])
+
+        priv = ec2.create_subnet(
+            VpcId=vpc_id, CidrBlock=PRIVATE_SUBNET_CIDRS[i], AvailabilityZone=az
+        )["Subnet"]
+        tag(priv["SubnetId"], f"{PROJECT_NAME}-private-{az}")
+        private_subnets.append(priv["SubnetId"])
+
+    print(f"Subnets públicas:  {public_subnets}")
+    print(f"Subnets privadas:  {private_subnets}")
     return public_subnets, private_subnets
 
 
 # ============================================================
-# 3. Internet Gateway + NAT Gateway
+# 4. Internet Gateway — porta de entrada/saída da VPC pra internet
 # ============================================================
 def create_igw(vpc_id):
-    def describe():
-        igws = ec2.describe_internet_gateways(Filters=[{"Name": "attachment.vpc-id", "Values": [vpc_id]}])["InternetGateways"]
-        return igws[0] if igws else None
-
-    def create():
-        igw = ec2.create_internet_gateway()["InternetGateway"]
-        ec2.attach_internet_gateway(InternetGatewayId=igw["InternetGatewayId"], VpcId=vpc_id)
-        tag(igw["InternetGatewayId"], f"{PROJECT_NAME}-igw")
-        return igw
-
-    return get_or_create("Internet Gateway", describe, create)["InternetGatewayId"]
+    igw_id = ec2.create_internet_gateway()["InternetGateway"]["InternetGatewayId"]
+    ec2.attach_internet_gateway(InternetGatewayId=igw_id, VpcId=vpc_id)
+    tag(igw_id, f"{PROJECT_NAME}-igw")
+    print(f"Internet Gateway criado e anexado: {igw_id}")
+    return igw_id
 
 
+# ============================================================
+# 5. NAT Gateway — vive na subnet pública, dá internet de SAÍDA às privadas
+# ============================================================
 def create_nat_gateway(public_subnet_id):
-    def describe():
-        nats = ec2.describe_nat_gateways(Filter=[{"Name": "tag:Name", "Values": [f"{PROJECT_NAME}-nat"]}])["NatGateways"]
-        return next((n for n in nats if n["State"] in {"available", "pending"}), None)
+    eip = ec2.allocate_address(Domain="vpc")
+    nat = ec2.create_nat_gateway(
+        SubnetId=public_subnet_id, AllocationId=eip["AllocationId"]
+    )["NatGateway"]
+    nat_id = nat["NatGatewayId"]
 
-    def create():
-        eip = ec2.allocate_address(Domain="vpc")
-        nat = ec2.create_nat_gateway(SubnetId=public_subnet_id, AllocationId=eip["AllocationId"])["NatGateway"]
-        print("Aguardando NAT Gateway ficar disponível (leva alguns minutos)...")
-        ec2.get_waiter("nat_gateway_available").wait(NatGatewayIds=[nat["NatGatewayId"]])
-        tag(nat["NatGatewayId"], f"{PROJECT_NAME}-nat")
-        return nat
-
-    nat = get_or_create("NAT Gateway", describe, create)
-    if nat["State"] != "available":
-        ec2.get_waiter("nat_gateway_available").wait(NatGatewayIds=[nat["NatGatewayId"]])
-    return nat["NatGatewayId"]
+    print("Aguardando NAT Gateway ficar disponível (leva alguns minutos)...")
+    ec2.get_waiter("nat_gateway_available").wait(NatGatewayIds=[nat_id])
+    tag(nat_id, f"{PROJECT_NAME}-nat")
+    print(f"NAT Gateway pronto: {nat_id}")
+    return nat_id
 
 
 # ============================================================
-# 4. Route Tables
+# 6. Route Tables — definem para onde o tráfego de cada subnet vai
 # ============================================================
-def setup_route_table(vpc_id, name, subnets, destination, gateway_id=None, nat_gateway_id=None):
-    def describe():
-        return find_by_name_tag(ec2.describe_route_tables, "tag:Name", "RouteTables", name)
-
-    def create():
-        rt = ec2.create_route_table(VpcId=vpc_id)["RouteTable"]
-        tag(rt["RouteTableId"], name)
-        return rt
-
-    rt_id = get_or_create(f"Route table {name}", describe, create)["RouteTableId"]
-
-    routes = ec2.describe_route_tables(RouteTableIds=[rt_id])["RouteTables"][0]["Routes"]
-    if not any(r.get("DestinationCidrBlock") == destination for r in routes):
-        params = {"RouteTableId": rt_id, "DestinationCidrBlock": destination}
-        params.update({"GatewayId": gateway_id} if gateway_id else {"NatGatewayId": nat_gateway_id})
-        ec2.create_route(**params)
-
-    associated = {a.get("SubnetId") for a in ec2.describe_route_tables(RouteTableIds=[rt_id])["RouteTables"][0]["Associations"]}
-    for subnet_id in subnets:
-        if subnet_id not in associated:
-            ec2.associate_route_table(RouteTableId=rt_id, SubnetId=subnet_id)
-
-    return rt_id
-
-
 def create_route_tables(vpc_id, igw_id, nat_id, public_subnets, private_subnets):
-    setup_route_table(vpc_id, f"{PROJECT_NAME}-public-rt", public_subnets, "0.0.0.0/0", gateway_id=igw_id)
-    setup_route_table(vpc_id, f"{PROJECT_NAME}-private-rt", private_subnets, "0.0.0.0/0", nat_gateway_id=nat_id)
+    # Rota pública: 0.0.0.0/0 -> Internet Gateway
+    public_rt = ec2.create_route_table(VpcId=vpc_id)["RouteTable"]["RouteTableId"]
+    ec2.create_route(
+        RouteTableId=public_rt, DestinationCidrBlock="0.0.0.0/0", GatewayId=igw_id
+    )
+    for subnet_id in public_subnets:
+        ec2.associate_route_table(RouteTableId=public_rt, SubnetId=subnet_id)
+    tag(public_rt, f"{PROJECT_NAME}-public-rt")
+
+    # Rota privada: 0.0.0.0/0 -> NAT Gateway
+    private_rt = ec2.create_route_table(VpcId=vpc_id)["RouteTable"]["RouteTableId"]
+    ec2.create_route(
+        RouteTableId=private_rt, DestinationCidrBlock="0.0.0.0/0", NatGatewayId=nat_id
+    )
+    for subnet_id in private_subnets:
+        ec2.associate_route_table(RouteTableId=private_rt, SubnetId=subnet_id)
+    tag(private_rt, f"{PROJECT_NAME}-private-rt")
+
     print("Route tables configuradas.")
+    return public_rt, private_rt
 
 
 # ============================================================
-# 5. Security Groups — cadeia: Internet -> ALB -> App -> RDS
+# 7. Security Groups — cadeia de confiança: Internet -> ALB -> App -> RDS
 # ============================================================
-def create_security_group(vpc_id, name, description):
-    def describe():
-        return find_by_name_tag(ec2.describe_security_groups, "tag:Name", "SecurityGroups", name)
-
-    def create():
-        sg = ec2.create_security_group(GroupName=name, Description=description, VpcId=vpc_id)
-        tag(sg["GroupId"], name)
-        return sg
-
-    return get_or_create(f"Security Group {name}", describe, create)["GroupId"]
-
-
 def create_security_groups(vpc_id):
-    alb_sg = create_security_group(vpc_id, f"{PROJECT_NAME}-alb-sg", "Trafego web para o ALB")
-    safe_authorize_ingress(alb_sg, [
-        {"IpProtocol": "tcp", "FromPort": p, "ToPort": p, "IpRanges": [{"CidrIp": "0.0.0.0/0"}]}
-        for p in (80, 443)
-    ])
+    # SG do Load Balancer: aceita HTTP/HTTPS de qualquer lugar
+    alb_sg = ec2.create_security_group(
+        GroupName=f"{PROJECT_NAME}-alb-sg",
+        Description="Libera trafego web para o ALB",
+        VpcId=vpc_id,
+    )["GroupId"]
+    ec2.authorize_security_group_ingress(
+        GroupId=alb_sg,
+        IpPermissions=[
+            {"IpProtocol": "tcp", "FromPort": 80, "ToPort": 80,
+             "IpRanges": [{"CidrIp": "0.0.0.0/0"}]},
+            {"IpProtocol": "tcp", "FromPort": 443, "ToPort": 443,
+             "IpRanges": [{"CidrIp": "0.0.0.0/0"}]},
+        ],
+    )
 
-    app_sg = create_security_group(vpc_id, f"{PROJECT_NAME}-app-sg", "Trafego apenas vindo do ALB")
-    safe_authorize_ingress(app_sg, [
-        {"IpProtocol": "tcp", "FromPort": EC2_APP_PORT, "ToPort": EC2_APP_PORT,
-         "UserIdGroupPairs": [{"GroupId": alb_sg}]},
-    ])
-    if EC2_KEY_NAME:
-        safe_authorize_ingress(app_sg, [
-            {"IpProtocol": "tcp", "FromPort": 22, "ToPort": 22, "IpRanges": [{"CidrIp": "0.0.0.0/0"}]},
-        ])
+    # SG da aplicação: só aceita tráfego que vem do ALB (não do mundo).
+    # Porta 80 porque quem responde agora é o Nginx (proxy reverso pro
+    # backend, que fica isolado em 127.0.0.1:8000 dentro da própria instância)
+    app_sg = ec2.create_security_group(
+        GroupName=f"{PROJECT_NAME}-app-sg",
+        Description="Libera trafego apenas vindo do ALB",
+        VpcId=vpc_id,
+    )["GroupId"]
+    ec2.authorize_security_group_ingress(
+        GroupId=app_sg,
+        IpPermissions=[
+            {"IpProtocol": "tcp", "FromPort": EC2_APP_PORT, "ToPort": EC2_APP_PORT,
+             "UserIdGroupPairs": [{"GroupId": alb_sg}]},
+        ],
+    )
 
-    rds_sg = create_security_group(vpc_id, f"{PROJECT_NAME}-rds-sg", "Postgres apenas para a aplicacao")
-    safe_authorize_ingress(rds_sg, [
-        {"IpProtocol": "tcp", "FromPort": 5432, "ToPort": 5432, "UserIdGroupPairs": [{"GroupId": app_sg}]},
-    ])
+    # SG do RDS: só aceita conexão Postgres vinda da aplicação
+    rds_sg = ec2.create_security_group(
+        GroupName=f"{PROJECT_NAME}-rds-sg",
+        Description="Libera Postgres apenas para a aplicacao",
+        VpcId=vpc_id,
+    )["GroupId"]
+    ec2.authorize_security_group_ingress(
+        GroupId=rds_sg,
+        IpPermissions=[
+            {"IpProtocol": "tcp", "FromPort": 5432, "ToPort": 5432,
+             "UserIdGroupPairs": [{"GroupId": app_sg}]},
+        ],
+    )
 
     print(f"Security Groups -> ALB: {alb_sg} | App: {app_sg} | RDS: {rds_sg}")
     return alb_sg, app_sg, rds_sg
 
 
 # ============================================================
-# 6. Application Load Balancer
+# 8. Application Load Balancer
 # ============================================================
 def create_load_balancer(public_subnets, alb_sg, vpc_id):
-    def describe_lb():
-        try:
-            return elbv2.describe_load_balancers(Names=[f"{PROJECT_NAME}-alb"])["LoadBalancers"][0]
-        except ClientError:
-            return None
+    lb = elbv2.create_load_balancer(
+        Name=f"{PROJECT_NAME}-alb",
+        Subnets=public_subnets,
+        SecurityGroups=[alb_sg],
+        Scheme="internet-facing",
+        Type="application",
+        IpAddressType="ipv4",
+    )["LoadBalancers"][0]
+    lb_arn = lb["LoadBalancerArn"]
 
-    def create_lb():
-        return elbv2.create_load_balancer(
-            Name=f"{PROJECT_NAME}-alb", Subnets=public_subnets, SecurityGroups=[alb_sg],
-            Scheme="internet-facing", Type="application", IpAddressType="ipv4",
-        )["LoadBalancers"][0]
+    # Target group: pra onde o ALB manda o tráfego. Porta 80 = Nginx.
+    tg = elbv2.create_target_group(
+        Name=f"{PROJECT_NAME}-tg",
+        Protocol="HTTP",
+        Port=EC2_APP_PORT,
+        VpcId=vpc_id,
+        TargetType="instance",
+        HealthCheckPath="/",
+    )["TargetGroups"][0]
+    tg_arn = tg["TargetGroupArn"]
 
-    lb_arn = get_or_create("Load Balancer", describe_lb, create_lb)["LoadBalancerArn"]
+    elbv2.create_listener(
+        LoadBalancerArn=lb_arn,
+        Protocol="HTTP",
+        Port=80,
+        DefaultActions=[{"Type": "forward", "TargetGroupArn": tg_arn}],
+    )
 
-    def describe_tg():
-        try:
-            return elbv2.describe_target_groups(Names=[f"{PROJECT_NAME}-tg"])["TargetGroups"][0]
-        except ClientError:
-            return None
-
-    def create_tg():
-        return elbv2.create_target_group(
-            Name=f"{PROJECT_NAME}-tg", Protocol="HTTP", Port=EC2_APP_PORT, VpcId=vpc_id,
-            TargetType="instance", HealthCheckPath="/health", HealthCheckIntervalSeconds=30,
-            HealthCheckTimeoutSeconds=10, HealthyThresholdCount=2, UnhealthyThresholdCount=5,
-        )["TargetGroups"][0]
-
-    tg_arn = get_or_create("Target Group", describe_tg, create_tg)["TargetGroupArn"]
-
-    listeners = elbv2.describe_listeners(LoadBalancerArn=lb_arn)["Listeners"]
-    if not any(l["Port"] == 80 for l in listeners):
-        elbv2.create_listener(
-            LoadBalancerArn=lb_arn, Protocol="HTTP", Port=80,
-            DefaultActions=[{"Type": "forward", "TargetGroupArn": tg_arn}],
-        )
-
-    lb_dns = elbv2.describe_load_balancers(LoadBalancerArns=[lb_arn])["LoadBalancers"][0]["DNSName"]
-    print(f"Load Balancer preparado: {lb_dns}")
+    print(f"Load Balancer criado: {lb['DNSName']}")
     return lb_arn, tg_arn
 
 
 # ============================================================
-# 7. User data (bootstrap de cada instância)
+# 9. Launch Template — "molde" que o Auto Scaling usa pra criar instâncias
+#    (igual ao Lab 6, mas em vez de criar a AMI na mão, geramos o template
+#    direto por código)
 # ============================================================
+import base64
+
+
 def user_data_script(db_endpoint):
     """
-    Roda no boot de cada instância do Auto Scaling:
-      0. Loga tudo em /var/log/user-data.log (set -x) -- essencial pra
-         debugar 502 (causa mais comum: backend não sobe e Nginx nunca é
-         configurado, por causa do set -e).
-      1. Instala Python/Git/Node 20/Nginx + libs de build do psycopg2.
-      2. Cria swapfile (build do Vite pode apertar a memória do t3.small).
-      3. Clona e sobe o backend FastAPI via systemd em 127.0.0.1:8000,
-         nunca exposto direto -- credencial do banco via EnvironmentFile
-         com permissão 600 (não em texto puro no unit file, que é 644).
-      4. Clona e builda o frontend estático (VITE_API_URL=/api).
-      5. Nginx: serve o front com fallback SPA pra /index.html, /health
-         direto (sem depender do backend) e proxy dedicado de /api/* pro
-         backend.
+    Script que roda automaticamente quando cada instância do Auto Scaling liga.
+
+    O que ele faz, na ordem:
+      1. Instala Docker, Git, Node.js 20 e Nginx.
+      2. Cria um swapfile (t2.micro só tem 1GB RAM — o build do Vite pode
+         estourar memória sem isso).
+      3. Clona o backend (FastAPI) e sobe ele em um container Docker,
+         escutando SÓ em 127.0.0.1:8000 (nunca exposto direto pra internet).
+         A DATABASE_URL do RDS Postgres é injetada aqui — fica fixa no
+         backend, o usuário final nunca vê nem digita esse dado.
+      4. Clona o frontend (React/Vite), builda como arquivos estáticos
+         (VITE_API_URL=/api é embutido no JS nessa hora).
+      5. Configura o Nginx como porta de entrada única (porta 80): serve os
+         arquivos do frontend e faz proxy reverso de /api/* pro backend.
+         Isso resolve CORS de graça, porque front e API ficam na mesma
+         origem do ponto de vista do navegador.
     """
     db_url = f"postgresql://{DB_USER}:{DB_PASSWORD}@{db_endpoint}:5432/{DB_NAME}"
 
     return f"""#!/bin/bash
-exec > >(tee /var/log/user-data.log) 2>&1
-set -x
 set -e
 
-retry() {{
-  local n=0 max=5
-  until "$@"; do
-    n=$((n+1))
-    [ "$n" -ge "$max" ] && {{ echo "Comando falhou depois de $max tentativas: $*"; return 1; }}
-    echo "Tentativa $n falhou, tentando de novo em 10s: $*"
-    sleep 10
-  done
-}}
-
+# ---- Dependências base ----
 dnf update -y
-dnf install -y python3 python3-pip python3-devel gcc git nginx libpq-devel
-retry curl -fsSL https://rpm.nodesource.com/setup_20.x -o /tmp/nodesource_setup.sh
-bash /tmp/nodesource_setup.sh
+dnf install -y docker git nginx
+
+# Node.js 20 (o AL2023 traz uma versão mais antiga por padrão via dnf)
+curl -fsSL https://rpm.nodesource.com/setup_20.x | bash -
 dnf install -y nodejs
 
-# Swap: evita OOM durante o npm run build
+systemctl enable --now docker
+usermod -aG docker ec2-user
+
+# ---- Swap: evita OOM durante o npm run build em instância t2.micro (1GB RAM) ----
 dd if=/dev/zero of=/swapfile bs=128M count=16
 chmod 600 /swapfile
 mkswap /swapfile
 swapon /swapfile
 
-# Nginx sobe cedo servindo uma pagina de "preparando" + /health, pro ALB
-# ja ter o que responder enquanto backend/frontend ainda instalam.
-mkdir -p /var/www/frontend
-cat > /var/www/frontend/index.html << 'HTMLEOF'
-<html><body><h1>Preparando aplicacao, aguarde...</h1></body></html>
-HTMLEOF
-cat > /etc/nginx/conf.d/todo.conf << 'NGINXEOF'
-server {{
-    listen 80;
-    root /var/www/frontend;
-    index index.html;
-
-    location /health {{
-        default_type text/plain;
-        return 200 "starting";
-    }}
-
-    location / {{
-        try_files $uri $uri/ /index.html;
-    }}
-}}
-NGINXEOF
-rm -f /etc/nginx/conf.d/default.conf
-systemctl enable --now nginx
-
-# Backend
+# ---- Backend (FastAPI, rodando em container Docker) ----
 cd /home/ec2-user
-retry git clone {REPO_BACKEND_URL} backend
+git clone {REPO_BACKEND_URL} backend
 cd backend
-retry python3 -m pip install poetry
-python3 -m pip install psycopg2-binary
-poetry install --only main
+docker build -t todo-backend .
+docker run -d --name backend --restart always \\
+  -p 127.0.0.1:8000:8000 \\
+  -e DATABASE_URL="{db_url}" \\
+  todo-backend
 
-cat > /home/ec2-user/start_backend.sh << 'STARTEOF'
-#!/bin/bash
-set -e
-cd /home/ec2-user/backend
-if [ -f app/main.py ]; then APP_MODULE="app.main:app"; else APP_MODULE="main:app"; fi
-for i in $(seq 1 24); do
-  if python3 - <<'PY'
-import os, socket
-url = os.environ.get("DATABASE_URL", "")
-if not url:
-    raise SystemExit(1)
-try:
-    socket.create_connection((url.split("@")[-1].split(":")[0], 5432), timeout=2)
-    raise SystemExit(0)
-except Exception:
-    raise SystemExit(1)
-PY
-  then break; fi
-  echo "Aguardando RDS ficar acessivel... tentativa $i/24"
-  sleep 10
-done
-exec /usr/bin/python3 -m uvicorn "$APP_MODULE" --host 127.0.0.1 --port 8000
-STARTEOF
-chmod +x /home/ec2-user/start_backend.sh
-
-umask 077
-cat > /etc/backend.env << 'ENVEOF'
-DATABASE_URL={db_url}
-ENVEOF
-chmod 600 /etc/backend.env
-chown root:root /etc/backend.env
-
-cat > /etc/systemd/system/backend.service << 'SERVICEEOF'
-[Unit]
-Description=FastAPI Backend
-After=network.target
-
-[Service]
-WorkingDirectory=/home/ec2-user/backend
-EnvironmentFile=/etc/backend.env
-ExecStart=/home/ec2-user/start_backend.sh
-Restart=always
-RestartSec=5
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-SERVICEEOF
-systemctl daemon-reload
-systemctl enable --now backend
-
-# Frontend
+# ---- Frontend (React + Vite, build estático servido pelo Nginx) ----
 cd /home/ec2-user
-retry git clone {REPO_FRONTEND_URL} frontend
+git clone {REPO_FRONTEND_URL} frontend
 cd frontend
 echo "VITE_API_URL=/api" > .env.production
-retry npm ci || retry npm install
+npm ci
 npm run build
-rm -rf /var/www/frontend/*
+mkdir -p /var/www/frontend
 cp -r dist/* /var/www/frontend/
 
-# Nginx final: /health local, /api/* proxy dedicado, resto cai no SPA
+# ---- Nginx: serve o front e faz proxy reverso do /api pro backend ----
 cat > /etc/nginx/conf.d/todo.conf << 'NGINXEOF'
 server {{
     listen 80;
+
     root /var/www/frontend;
     index index.html;
-
-    location /health {{
-        default_type text/plain;
-        return 200 "ok";
-    }}
 
     location /api/ {{
         proxy_pass http://127.0.0.1:8000/;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_connect_timeout 5s;
+    }}
+
+    location /health {{
+        return 200 'OK';
+        add_header Content-Type text/plain;
     }}
 
     location / {{
@@ -491,134 +390,120 @@ server {{
     }}
 }}
 NGINXEOF
+
+rm -f /etc/nginx/conf.d/default.conf
+systemctl enable --now nginx
 systemctl restart nginx
-
-# Espera o backend responder de verdade (ate ~6min: RDS + build)
-ok=0
-for i in $(seq 1 36); do
-  curl -fsS http://127.0.0.1:8000/health >/dev/null 2>&1 && {{ ok=1; break; }}
-  sleep 10
-done
-
-if [ "$ok" -eq 1 ]; then
-  echo "Backend respondendo. Bootstrap concluido com sucesso."
-else
-  echo "AVISO: backend nao respondeu a tempo. Diagnostico:"
-  systemctl status backend --no-pager || true
-  journalctl -u backend -n 80 --no-pager || true
-fi
 """
 
 
-# ============================================================
-# 8. Launch Template + Auto Scaling Group
-# ============================================================
 def create_launch_template(app_sg, db_endpoint):
-    def describe():
-        try:
-            return ec2.describe_launch_templates(LaunchTemplateNames=[f"{PROJECT_NAME}-lt"])["LaunchTemplates"][0]
-        except ClientError:
-            return None
+    lt_data = {
+        "ImageId": EC2_AMI_ID,
+        "InstanceType": EC2_INSTANCE_TYPE,
+        "SecurityGroupIds": [app_sg],
+        "IamInstanceProfile": {"Name": EC2_INSTANCE_PROFILE},
+        "UserData": base64.b64encode(user_data_script(db_endpoint).encode()).decode(),
+        "TagSpecifications": [{
+            "ResourceType": "instance",
+            "Tags": [{"Key": "Name", "Value": f"{PROJECT_NAME}-web"}],
+        }],
+    }
+    if EC2_KEY_NAME:
+        lt_data["KeyName"] = EC2_KEY_NAME
 
-    def create():
-        lt_data = {
-            "ImageId": EC2_AMI_ID,
-            "InstanceType": EC2_INSTANCE_TYPE,
-            "SecurityGroupIds": [app_sg],
-            "IamInstanceProfile": {"Name": EC2_INSTANCE_PROFILE},
-            "UserData": base64.b64encode(user_data_script(db_endpoint).encode()).decode(),
-            "TagSpecifications": [{"ResourceType": "instance", "Tags": [{"Key": "Name", "Value": f"{PROJECT_NAME}-web"}]}],
-        }
-        if EC2_KEY_NAME:
-            lt_data["KeyName"] = EC2_KEY_NAME
-        return ec2.create_launch_template(LaunchTemplateName=f"{PROJECT_NAME}-lt", LaunchTemplateData=lt_data)["LaunchTemplate"]
-
-    return get_or_create("Launch Template", describe, create)["LaunchTemplateId"]
+    lt = ec2.create_launch_template(
+        LaunchTemplateName=f"{PROJECT_NAME}-lt",
+        LaunchTemplateData=lt_data,
+    )["LaunchTemplate"]
+    print(f"Launch Template criado: {lt['LaunchTemplateId']}")
+    return lt["LaunchTemplateId"]
 
 
+# ============================================================
+# 10. Auto Scaling Group — mantém 2 a 6 instâncias atrás do ALB
+#     (equivalente à Tarefa 3 do Lab 6, mas via código)
+# ============================================================
 def create_auto_scaling_group(lt_id, public_subnets, tg_arn):
-    existing = autoscaling.describe_auto_scaling_groups(AutoScalingGroupNames=[f"{PROJECT_NAME}-asg"])["AutoScalingGroups"]
-    if existing:
-        print(f"Auto Scaling Group já existe: {existing[0]['AutoScalingGroupName']}")
-        return
-
-    azs = list({s["AvailabilityZone"] for s in ec2.describe_subnets(SubnetIds=public_subnets)["Subnets"]})
+    azs = list({
+        s["AvailabilityZone"]
+        for s in ec2.describe_subnets(SubnetIds=public_subnets)["Subnets"]
+    })
 
     autoscaling.create_auto_scaling_group(
         AutoScalingGroupName=f"{PROJECT_NAME}-asg",
         LaunchTemplate={"LaunchTemplateId": lt_id, "Version": "$Latest"},
-        MinSize=2, MaxSize=6, DesiredCapacity=2,
+        MinSize=2,
+        MaxSize=6,
+        DesiredCapacity=2,
         VPCZoneIdentifier=",".join(public_subnets),
         AvailabilityZones=azs,
         TargetGroupARNs=[tg_arn],
         HealthCheckType="ELB",
-        # Grace period generoso: da tempo do bootstrap (clone + build +
-        # espera pelo RDS) terminar antes do ALB reciclar por "unhealthy".
-        HealthCheckGracePeriod=420,
-        Tags=[{"Key": "Name", "Value": f"{PROJECT_NAME}-web", "PropagateAtLaunch": True}],
+        HealthCheckGracePeriod=120,
+        Tags=[{
+            "Key": "Name", "Value": f"{PROJECT_NAME}-web",
+            "PropagateAtLaunch": True,
+        }],
     )
+    print("Auto Scaling Group criado (2 a 6 instâncias, atrás do ALB).")
+
+    # Política de scaling por CPU — igual ao Lab 6 (alvo 60% de utilização)
     autoscaling.put_scaling_policy(
         AutoScalingGroupName=f"{PROJECT_NAME}-asg",
         PolicyName=f"{PROJECT_NAME}-scaling-policy",
         PolicyType="TargetTrackingScaling",
         TargetTrackingConfiguration={
-            "PredefinedMetricSpecification": {"PredefinedMetricType": "ASGAverageCPUUtilization"},
+            "PredefinedMetricSpecification": {
+                "PredefinedMetricType": "ASGAverageCPUUtilization"
+            },
             "TargetValue": 60.0,
         },
     )
-    print("Auto Scaling Group criado (2-6 instâncias, CPU alvo 60%).")
+    print("Política de Auto Scaling (CPU 60%) configurada.")
 
 
 # ============================================================
-# 9. RDS PostgreSQL — Multi-AZ, subnets privadas
+# 11. RDS PostgreSQL — Multi-AZ, dentro das subnets privadas
 # ============================================================
 def create_rds(private_subnets, rds_sg):
-    subnet_group_name = f"{PROJECT_NAME}-db-subnet-group"
-    db_identifier = f"{PROJECT_NAME}-db"
+    # DB Subnet Group precisa cobrir pelo menos 2 AZs — é isso que habilita o Multi-AZ
+    rds.create_db_subnet_group(
+        DBSubnetGroupName=f"{PROJECT_NAME}-db-subnet-group",
+        DBSubnetGroupDescription="Subnets privadas para o RDS",
+        SubnetIds=private_subnets,
+    )
 
-    try:
-        rds.create_db_subnet_group(
-            DBSubnetGroupName=subnet_group_name,
-            DBSubnetGroupDescription="Subnets privadas para o RDS",
-            SubnetIds=private_subnets,
-        )
-        print(f"DB subnet group criado: {subnet_group_name}")
-    except ClientError as exc:
-        if exc.response["Error"]["Code"] != "DBSubnetGroupAlreadyExists":
-            raise
-        print(f"DB subnet group já existe: {subnet_group_name}")
+    print("Criando instância RDS Multi-AZ (leva de 5 a 10 minutos)...")
+    rds.create_db_instance(
+        DBInstanceIdentifier=f"{PROJECT_NAME}-db",
+        DBName=DB_NAME,
+        Engine="postgres",
+        MasterUsername=DB_USER,
+        MasterUserPassword=DB_PASSWORD,
+        DBInstanceClass=DB_INSTANCE_CLASS,
+        AllocatedStorage=20,
+        VpcSecurityGroupIds=[rds_sg],
+        DBSubnetGroupName=f"{PROJECT_NAME}-db-subnet-group",
+        MultiAZ=True,             # cria réplica síncrona automática na 2ª AZ
+        PubliclyAccessible=False,  # fica só acessível de dentro da VPC
+        BackupRetentionPeriod=7,
+        StorageEncrypted=True,
+    )
 
-    try:
-        rds.describe_db_instances(DBInstanceIdentifier=db_identifier)
-        print(f"Instância RDS já existe: {db_identifier}")
-    except ClientError as exc:
-        if exc.response["Error"]["Code"] not in {"DBInstanceNotFound", "DBInstanceNotFoundFault"}:
-            raise
-        print("Criando instância RDS Multi-AZ (leva de 5 a 10 minutos)...")
-        rds.create_db_instance(
-            DBInstanceIdentifier=db_identifier,
-            DBName=DB_NAME,
-            Engine="postgres",
-            MasterUsername=DB_USER,
-            MasterUserPassword=DB_PASSWORD,
-            DBInstanceClass=DB_INSTANCE_CLASS,
-            AllocatedStorage=20,
-            VpcSecurityGroupIds=[rds_sg],
-            DBSubnetGroupName=subnet_group_name,
-            MultiAZ=True,              # réplica síncrona automática na 2ª AZ
-            PubliclyAccessible=False,  # só acessível de dentro da VPC
-            BackupRetentionPeriod=7,
-            StorageEncrypted=True,
-        )
+    rds.get_waiter("db_instance_available").wait(
+        DBInstanceIdentifier=f"{PROJECT_NAME}-db"
+    )
 
-    rds.get_waiter("db_instance_available").wait(DBInstanceIdentifier=db_identifier)
-    endpoint = rds.describe_db_instances(DBInstanceIdentifier=db_identifier)["DBInstances"][0]["Endpoint"]["Address"]
+    endpoint = rds.describe_db_instances(
+        DBInstanceIdentifier=f"{PROJECT_NAME}-db"
+    )["DBInstances"][0]["Endpoint"]["Address"]
     print(f"RDS disponível em: {endpoint}")
     return endpoint
 
 
 # ============================================================
-# EXECUÇÃO — a ordem importa (cada recurso depende do anterior)
+# EXECUÇÃO — a ordem aqui importa (cada recurso depende do anterior)
 # ============================================================
 if __name__ == "__main__":
     vpc_id = create_vpc()
@@ -630,22 +515,20 @@ if __name__ == "__main__":
     alb_sg, app_sg, rds_sg = create_security_groups(vpc_id)
     lb_arn, tg_arn = create_load_balancer(public_subnets, alb_sg, vpc_id)
 
-    # RDS demora 5-10min -- criamos antes do ASG pra já nascer sabendo o
-    # endpoint do banco (fica fixo no backend do app via user-data).
+    # RDS demora 5-10min pra ficar pronto — criamos antes do Auto Scaling pra já
+    # nascer sabendo o endpoint do banco (fica fixo no backend do app)
     db_endpoint = create_rds(private_subnets, rds_sg)
 
     lt_id = create_launch_template(app_sg, db_endpoint)
     create_auto_scaling_group(lt_id, public_subnets, tg_arn)
 
-    lb_dns = elbv2.describe_load_balancers(LoadBalancerArns=[lb_arn])["LoadBalancers"][0]["DNSName"]
+    lb_dns = elbv2.describe_load_balancers(LoadBalancerArns=[lb_arn])[
+        "LoadBalancers"
+    ][0]["DNSName"]
 
     print("\n=== INFRAESTRUTURA CRIADA COM SUCESSO ===")
-    print(f"VPC ID:      {vpc_id}")
-    print(f"DB Endpoint: {db_endpoint}")
-    print(f"URL do App:  http://{lb_dns}")
-    print("\nO Auto Scaling Group leva alguns minutos pra subir as instâncias")
-    print("(clone + build + espera pelo RDS). /health responde 'starting' assim")
-    print("que o Nginx sobe, e 'ok' quando a config final é aplicada.")
-    print("Se travar em 'starting' por muito tempo, via SSH (se EC2_KEY_NAME")
-    print("estiver configurado): cat /var/log/user-data.log")
-    print("                       journalctl -u backend -n 100 --no-pager")
+    print(f"VPC ID:        {vpc_id}")
+    print(f"DB Endpoint:   {db_endpoint}")
+    print(f"URL do App:    http://{lb_dns}")
+    print("\nO Auto Scaling Group vai demorar 1-2min pra subir as 2 instâncias iniciais.")
+    print("Aguarde mais ~1min pro health check do ALB ficar 'healthy' antes de testar a URL.")
