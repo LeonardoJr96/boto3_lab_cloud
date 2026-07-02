@@ -282,7 +282,7 @@ def create_load_balancer(public_subnets, alb_sg, vpc_id):
         Port=EC2_APP_PORT,
         VpcId=vpc_id,
         TargetType="instance",
-        HealthCheckPath="/health",
+        HealthCheckPath="/",
     )["TargetGroups"][0]
     tg_arn = tg["TargetGroupArn"]
 
