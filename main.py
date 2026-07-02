@@ -282,7 +282,7 @@ def create_load_balancer(public_subnets, alb_sg, vpc_id):
         Port=EC2_APP_PORT,
         VpcId=vpc_id,
         TargetType="instance",
-        HealthCheckPath="/",
+        HealthCheckPath="/health",
     )["TargetGroups"][0]
     tg_arn = tg["TargetGroupArn"]
 
@@ -381,8 +381,9 @@ server {{
     }}
 
     location /health {{
-        return 200 'OK';
-        add_header Content-Type text/plain;
+        proxy_pass http://127.0.0.1:8000/health;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
     }}
 
     location / {{
